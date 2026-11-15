@@ -4,6 +4,9 @@ const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const { syncDB } = require('./config/db');
 
+const authRoutes = require('./routes/authRoutes');
+const groupRoutes = require('./routes/groupRoutes');   // ← NEW
+
 const app = express();
 
 app.use(cors({
@@ -14,6 +17,9 @@ app.use(express.json());
 app.use(cookieParser());
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
+
+app.use('/api/auth', authRoutes);
+app.use('/api/groups', groupRoutes);   // ← NEW
 
 app.use((req, res) => res.status(404).json({ message: 'Route not found' }));
 
