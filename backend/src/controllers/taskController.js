@@ -7,6 +7,8 @@ const GroupMember = require('../models/GroupMember');
 const User = require('../models/User');
 const Group = require('../models/Group');
 const logActivity = require('../utils/logActivity');
+const { getIO } = require('../sockets');
+const sendNotification = require('../utils/sendNotification');
 
 // Helper: user us group ka member/leader hai?
 const checkGroupAccess = async (userId, role, groupId) => {
@@ -18,10 +20,6 @@ const checkGroupAccess = async (userId, role, groupId) => {
 
 // ==================== CREATE ====================
 
-/**
- * POST /api/tasks  (admin/leader)
- * Body: { title, description, priority, groupId, assignedTo?, deadline?, estimatedHours? }
- */
 exports.createTask = async (req, res) => {
   const t = await sequelize.transaction();
   try {
@@ -38,7 +36,6 @@ exports.createTask = async (req, res) => {
       return res.status(403).json({ message: 'Only leader/admin can create task in this group' });
     }
 
-    // Agar assignedTo diya toh verify karo
     if (assignedTo) {
       const m = await GroupMember.findOne({
         where: { groupId, userId: assignedTo, status: 'active' },
@@ -64,7 +61,6 @@ exports.createTask = async (req, res) => {
       { transaction: t }
     );
 
-    // TaskAssignment history
     if (assignedTo) {
       await TaskAssignment.create(
         {
@@ -102,6 +98,24 @@ exports.createTask = async (req, res) => {
       });
     }
 
+    // ============ SOCKET + NOTIFICATION ============
+    const io = getIO();
+    if (io) {
+      io.to(`group:${groupId}`).emit('task:created', task);
+
+      if (assignedTo) {
+        await sendNotification(io, {
+          userId: assignedTo,
+          type: 'task_assigned',
+          title: 'New task assigned',
+          message: `You have been assigned: ${task.title}`,
+          link: `/tasks/${task.id}`,
+          entityType: 'task',
+          entityId: task.id,
+        });
+      }
+    }
+
     res.status(201).json({ message: 'Task created', task });
   } catch (err) {
     await t.rollback();
@@ -111,26 +125,18 @@ exports.createTask = async (req, res) => {
 
 // ==================== LIST ====================
 
-/**
- * GET /api/tasks
- * Query: ?lifecycle=upcoming|current|completed&groupId=&assignedTo=&priority=
- */
 exports.getTasks = async (req, res) => {
   try {
     const { lifecycle, groupId, assignedTo, priority } = req.query;
     const where = { deletedAt: null };
 
-    // Role-based filter
     if (req.user.role !== 'admin') {
-      // Apne groups
       const memberships = await GroupMember.findAll({
         where: { userId: req.user.id, status: 'active' },
         attributes: ['groupId', 'role'],
       });
-      const myGroupIds = memberships.map((m) => m.groupId);
       const leaderOf = memberships.filter((m) => m.role === 'leader').map((m) => m.groupId);
 
-      // Leader: apne group ke sab tasks; Member: sirf assigned
       const orConditions = [];
       if (leaderOf.length) orConditions.push({ groupId: { [Op.in]: leaderOf } });
       orConditions.push({ assignedTo: req.user.id });
@@ -142,7 +148,6 @@ exports.getTasks = async (req, res) => {
     if (assignedTo) where.assignedTo = assignedTo;
     if (priority) where.priority = priority;
 
-    // Lifecycle filter
     if (lifecycle === 'upcoming') {
       where.status = 'todo';
     } else if (lifecycle === 'current') {
@@ -164,7 +169,6 @@ exports.getTasks = async (req, res) => {
       ],
     });
 
-    // Overdue flag calculate
     const now = new Date();
     const enriched = tasks.map((task) => {
       const t = task.toJSON();
@@ -180,9 +184,6 @@ exports.getTasks = async (req, res) => {
 
 // ==================== DETAIL ====================
 
-/**
- * GET /api/tasks/:id
- */
 exports.getTaskById = async (req, res) => {
   try {
     const task = await Task.findOne({
@@ -198,7 +199,6 @@ exports.getTaskById = async (req, res) => {
 
     if (!task) return res.status(404).json({ message: 'Task not found' });
 
-    // Access check
     if (req.user.role !== 'admin') {
       const access = await checkGroupAccess(req.user.id, req.user.role, task.groupId);
       if (!access.allowed) return res.status(403).json({ message: 'Access denied' });
@@ -215,15 +215,11 @@ exports.getTaskById = async (req, res) => {
 
 // ==================== UPDATE ====================
 
-/**
- * PUT /api/tasks/:id  (admin/leader/assignee)
- */
 exports.updateTask = async (req, res) => {
   try {
     const task = await Task.findOne({ where: { id: req.params.id, deletedAt: null } });
     if (!task) return res.status(404).json({ message: 'Task not found' });
 
-    // Access
     if (req.user.role !== 'admin') {
       const access = await checkGroupAccess(req.user.id, req.user.role, task.groupId);
       if (!access.allowed) return res.status(403).json({ message: 'Access denied' });
@@ -256,6 +252,12 @@ exports.updateTask = async (req, res) => {
       metadata: { isGroupLeader: req.user.role !== 'admin' },
     });
 
+    // ============ SOCKET ============
+    const io = getIO();
+    if (io) {
+      io.to(`group:${task.groupId}`).emit('task:updated', task);
+    }
+
     res.json({ message: 'Task updated', task });
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
@@ -264,9 +266,6 @@ exports.updateTask = async (req, res) => {
 
 // ==================== SOFT DELETE ====================
 
-/**
- * DELETE /api/tasks/:id  (admin/leader/assignee)
- */
 exports.deleteTask = async (req, res) => {
   try {
     const task = await Task.findOne({ where: { id: req.params.id, deletedAt: null } });
@@ -294,22 +293,32 @@ exports.deleteTask = async (req, res) => {
       metadata: { isGroupLeader: req.user.role !== 'admin' },
     });
 
+    // ============ SOCKET ============
+    const io = getIO();
+    if (io) {
+      io.to(`group:${task.groupId}`).emit('task:deleted', {
+        taskId: task.id,
+        deletedBy: req.user.id,
+      });
+      io.to('admin').emit('task:deleted', {
+        taskId: task.id,
+        taskName: task.title,
+        deletedBy: req.user.id,
+      });
+    }
+
     res.json({ message: 'Task soft-deleted', taskId: task.id });
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 };
 
-/**
- * POST /api/tasks/:id/restore  (admin/leader)
- */
 exports.restoreTask = async (req, res) => {
   try {
     const task = await Task.findByPk(req.params.id);
     if (!task) return res.status(404).json({ message: 'Task not found' });
     if (!task.deletedAt) return res.status(400).json({ message: 'Task not deleted' });
 
-    // Leader check (apne group)
     if (req.user.role !== 'admin') {
       const access = await checkGroupAccess(req.user.id, req.user.role, task.groupId);
       if (!access.allowed || access.groupRole !== 'leader') {
@@ -331,6 +340,12 @@ exports.restoreTask = async (req, res) => {
       metadata: { isGroupLeader: req.user.role !== 'admin' },
     });
 
+    // ============ SOCKET ============
+    const io = getIO();
+    if (io) {
+      io.to(`group:${task.groupId}`).emit('task:restored', task);
+    }
+
     res.json({ message: 'Task restored', task });
   } catch (err) {
     res.status(500).json({ message: 'Server error', error: err.message });
@@ -339,10 +354,6 @@ exports.restoreTask = async (req, res) => {
 
 // ==================== TRANSFER ====================
 
-/**
- * POST /api/tasks/:id/transfer  (admin/leader)
- * Body: { toUserId, reason? }
- */
 exports.transferTask = async (req, res) => {
   const t = await sequelize.transaction();
   try {
@@ -358,7 +369,6 @@ exports.transferTask = async (req, res) => {
       return res.status(404).json({ message: 'Task not found' });
     }
 
-    // Access
     if (req.user.role !== 'admin') {
       const access = await checkGroupAccess(req.user.id, req.user.role, task.groupId);
       if (!access.allowed || access.groupRole !== 'leader') {
@@ -372,7 +382,6 @@ exports.transferTask = async (req, res) => {
       return res.status(400).json({ message: 'Already assigned to this user' });
     }
 
-    // Target member us group ka hai?
     const target = await GroupMember.findOne({
       where: { groupId: task.groupId, userId: toUserId, status: 'active' },
       transaction: t,
@@ -384,7 +393,6 @@ exports.transferTask = async (req, res) => {
 
     const oldAssignee = task.assignedTo;
 
-    // Close old assignment
     if (oldAssignee) {
       await TaskAssignment.update(
         { unassignedAt: new Date(), reason: reason || 'Transferred' },
@@ -392,7 +400,6 @@ exports.transferTask = async (req, res) => {
       );
     }
 
-    // New assignment
     await TaskAssignment.create(
       {
         taskId: task.id,
@@ -403,13 +410,11 @@ exports.transferTask = async (req, res) => {
       { transaction: t }
     );
 
-    // Update task
     task.assignedTo = toUserId;
     task.assignedBy = req.user.id;
     task.reassignedFrom = oldAssignee;
     task.reassignedAt = new Date();
     task.reassignedBy = req.user.id;
-    // Reset progress? No — status same rakho
     await task.save({ transaction: t });
 
     await t.commit();
@@ -426,6 +431,39 @@ exports.transferTask = async (req, res) => {
       metadata: { reason, isGroupLeader: req.user.role !== 'admin' },
     });
 
+    // ============ SOCKET + NOTIFICATIONS ============
+    const io = getIO();
+    if (io) {
+      io.to(`group:${task.groupId}`).emit('task:transferred', {
+        taskId: task.id,
+        from: oldAssignee,
+        to: toUserId,
+        task,
+      });
+
+      if (oldAssignee) {
+        await sendNotification(io, {
+          userId: oldAssignee,
+          type: 'task_transferred',
+          title: 'Task transferred away',
+          message: `"${task.title}" transferred to someone else`,
+          link: `/tasks/${task.id}`,
+          entityType: 'task',
+          entityId: task.id,
+        });
+      }
+
+      await sendNotification(io, {
+        userId: toUserId,
+        type: 'task_transferred',
+        title: 'New task transferred to you',
+        message: `You received: ${task.title}`,
+        link: `/tasks/${task.id}`,
+        entityType: 'task',
+        entityId: task.id,
+      });
+    }
+
     res.json({ message: 'Task transferred', task });
   } catch (err) {
     await t.rollback();
@@ -435,9 +473,6 @@ exports.transferTask = async (req, res) => {
 
 // ==================== TIMER: START ====================
 
-/**
- * POST /api/tasks/:id/start  (assignee only)
- */
 exports.startTask = async (req, res) => {
   const t = await sequelize.transaction();
   try {
@@ -492,6 +527,16 @@ exports.startTask = async (req, res) => {
       groupId: task.groupId,
     });
 
+    // ============ SOCKET ============
+    const io = getIO();
+    if (io) {
+      io.to(`group:${task.groupId}`).emit('task:started', {
+        taskId: task.id,
+        userId: req.user.id,
+        startedAt: task.startedAt,
+      });
+    }
+
     res.json({ message: 'Timer started', task });
   } catch (err) {
     await t.rollback();
@@ -501,9 +546,6 @@ exports.startTask = async (req, res) => {
 
 // ==================== TIMER: PAUSE ====================
 
-/**
- * POST /api/tasks/:id/pause
- */
 exports.pauseTask = async (req, res) => {
   const t = await sequelize.transaction();
   try {
@@ -525,7 +567,6 @@ exports.pauseTask = async (req, res) => {
 
     const now = new Date();
 
-    // Open WorkLog close karo
     const openLog = await WorkLog.findOne({
       where: { taskId: task.id, userId: req.user.id, endedAt: null },
       order: [['startedAt', 'DESC']],
@@ -550,6 +591,16 @@ exports.pauseTask = async (req, res) => {
       groupId: task.groupId,
     });
 
+    // ============ SOCKET ============
+    const io = getIO();
+    if (io) {
+      io.to(`group:${task.groupId}`).emit('task:paused', {
+        taskId: task.id,
+        userId: req.user.id,
+        pausedAt: task.pausedAt,
+      });
+    }
+
     res.json({ message: 'Timer paused', task });
   } catch (err) {
     await t.rollback();
@@ -559,9 +610,6 @@ exports.pauseTask = async (req, res) => {
 
 // ==================== TIMER: COMPLETE ====================
 
-/**
- * POST /api/tasks/:id/complete
- */
 exports.completeTask = async (req, res) => {
   const t = await sequelize.transaction();
   try {
@@ -583,7 +631,6 @@ exports.completeTask = async (req, res) => {
 
     const now = new Date();
 
-    // Open worklog close
     const openLog = await WorkLog.findOne({
       where: { taskId: task.id, userId: req.user.id, endedAt: null },
       order: [['startedAt', 'DESC']],
@@ -610,6 +657,32 @@ exports.completeTask = async (req, res) => {
       groupId: task.groupId,
     });
 
+    // ============ SOCKET + NOTIFICATIONS ============
+    const io = getIO();
+    if (io) {
+      io.to(`group:${task.groupId}`).emit('task:completed', {
+        taskId: task.id,
+        userId: req.user.id,
+        completedAt: task.completedAt,
+      });
+
+      // Leaders ko notification
+      const leaders = await GroupMember.findAll({
+        where: { groupId: task.groupId, role: 'leader', status: 'active' },
+      });
+      for (const l of leaders) {
+        await sendNotification(io, {
+          userId: l.userId,
+          type: 'task_completed',
+          title: 'Task completed',
+          message: `"${task.title}" has been completed`,
+          link: `/tasks/${task.id}`,
+          entityType: 'task',
+          entityId: task.id,
+        });
+      }
+    }
+
     res.json({ message: 'Task completed', task });
   } catch (err) {
     await t.rollback();
@@ -619,15 +692,11 @@ exports.completeTask = async (req, res) => {
 
 // ==================== HISTORY ====================
 
-/**
- * GET /api/tasks/:id/history
- */
 exports.getTaskHistory = async (req, res) => {
   try {
     const task = await Task.findByPk(req.params.id);
     if (!task) return res.status(404).json({ message: 'Task not found' });
 
-    // Access
     if (req.user.role !== 'admin') {
       const access = await checkGroupAccess(req.user.id, req.user.role, task.groupId);
       if (!access.allowed) return res.status(403).json({ message: 'Access denied' });
@@ -659,9 +728,6 @@ exports.getTaskHistory = async (req, res) => {
   }
 };
 
-/**
- * GET /api/tasks/deleted  (admin/leader)
- */
 exports.getDeletedTasks = async (req, res) => {
   try {
     const where = { deletedAt: { [Op.ne]: null } };
