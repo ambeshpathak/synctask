@@ -5,7 +5,12 @@ const cookieParser = require('cookie-parser');
 const { syncDB } = require('./config/db');
 
 const authRoutes = require('./routes/authRoutes');
-const groupRoutes = require('./routes/groupRoutes');   // ← NEW
+const groupRoutes = require('./routes/groupRoutes');
+const taskRoutes = require('./routes/taskRoutes');
+const projectRoutes = require('./routes/projectRoutes');
+const issueRoutes = require('./routes/issueRoutes');
+const commentRoutes = require('./routes/commentRoutes');
+const worklogRoutes = require('./routes/worklogRoutes');
 
 const app = express();
 
@@ -19,7 +24,12 @@ app.use(cookieParser());
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
 app.use('/api/auth', authRoutes);
-app.use('/api/groups', groupRoutes);   // ← NEW
+app.use('/api/groups', groupRoutes);
+app.use('/api/tasks', taskRoutes);
+app.use('/api/projects', projectRoutes);
+app.use('/api/issues', issueRoutes);
+app.use('/api/comments', commentRoutes);
+app.use('/api/worklogs', worklogRoutes);
 
 app.use((req, res) => res.status(404).json({ message: 'Route not found' }));
 
