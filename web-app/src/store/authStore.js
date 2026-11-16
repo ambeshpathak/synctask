@@ -1,0 +1,33 @@
+import { create } from 'zustand';
+import { authApi } from '../api/auth';
+
+export const useAuthStore = create((set) => ({
+  user: null,
+  loading: true,
+  setUser: (user) => set({ user }),
+  fetchMe: async () => {
+    try {
+      const res = await authApi.me();
+      set({ user: res.data.user, loading: false });
+    } catch (err) {
+      set({ user: null, loading: false });
+    }
+  },
+  login: async (data) => {
+    const res = await authApi.login(data);
+    localStorage.setItem('token', res.data.token);
+    set({ user: res.data.user });
+    return res.data;
+  },
+  register: async (data) => {
+    const res = await authApi.register(data);
+    localStorage.setItem('token', res.data.token);
+    set({ user: res.data.user });
+    return res.data;
+  },
+  logout: async () => {
+    await authApi.logout();
+    localStorage.removeItem('token');
+    set({ user: null });
+  },
+}));
